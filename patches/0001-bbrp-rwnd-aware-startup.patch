@@ -1,0 +1,125 @@
+--- a/net/ipv4/tcp_bbr.c
++++ b/net/ipv4/tcp_bbr.c
+@@ -177,12 +177,16 @@
+ /* To estimate if BBR_STARTUP mode (i.e. high_gain) has filled pipe... */
+ /* If bw has increased significantly (1.25x), there may be more bw available: */
+ static const u32 bbr_full_bw_thresh = BBR_UNIT * 5 / 4;
+ /* But after 3 rounds w/o significant bw growth, estimate pipe is full: */
+ static const u32 bbr_full_bw_cnt = 3;
+ 
++static bool rwnd_aware __read_mostly = true;
++module_param(rwnd_aware, bool, 0644);
++MODULE_PARM_DESC(rwnd_aware, "Do not count receive-window-limited rounds toward BBR STARTUP exit");
++
+ /* "long-term" ("LT") bandwidth estimator parameters... */
+ /* The minimum number of rounds in an LT bw sampling interval: */
+ static const u32 bbr_lt_intvl_min_rtts = 4;
+ /* If lost/delivered ratio > 20%, interval is "lossy" and we may be policed: */
+ static const u32 bbr_lt_loss_thresh = 50;
+ /* If 2 intervals have a bw ratio <= 1/8, their bw is "consistent": */
+@@ -859,12 +863,22 @@
+ 	extra_acked = bbr->ack_epoch_acked - expected_acked;
+ 	extra_acked = min(extra_acked, tcp_snd_cwnd(tp));
+ 	if (extra_acked > bbr->extra_acked[bbr->extra_acked_win_idx])
+ 		bbr->extra_acked[bbr->extra_acked_win_idx] = extra_acked;
+ }
+ 
++/* Return true if the sender's congestion window exceeds the receiver's
++ * advertised window, i.e. the connection is receive-window-limited.
++ */
++static bool bbrp_is_rwnd_limited(struct sock *sk)
++{
++	struct tcp_sock *tp = tcp_sk(sk);
++
++	return (u64)tcp_snd_cwnd(tp) * tp->mss_cache > tp->snd_wnd;
++}
++
+ /* Estimate when the pipe is full, using the change in delivery rate: BBR
+  * estimates that STARTUP filled the pipe if the estimated bw hasn't changed by
+  * at least bbr_full_bw_thresh (25%) after bbr_full_bw_cnt (3) non-app-limited
+  * rounds. Why 3 rounds: 1: rwin autotuning grows the rwin, 2: we fill the
+  * higher rwin, 3: we get higher delivery rate samples. Or transient
+  * cross-traffic or radio noise can go away. CUBIC Hystart shares a similar
+@@ -875,12 +889,20 @@
+ {
+ 	struct bbr *bbr = inet_csk_ca(sk);
+ 	u32 bw_thresh;
+ 
+ 	if (bbr_full_bw_reached(sk) || !bbr->round_start || rs->is_app_limited)
+ 		return;
++
++	if (rwnd_aware && bbrp_is_rwnd_limited(sk)) {
++		/* A receive-window-limited round is not evidence that the
++		 * path is full; don't count it toward STARTUP exit.
++		 */
++		bbr->full_bw_cnt = 0;
++		return;
++	}
+ 
+ 	bw_thresh = (u64)bbr->full_bw * bbr_full_bw_thresh >> BBR_SCALE;
+ 	if (bbr_max_bw(sk) >= bw_thresh) {
+ 		bbr->full_bw = bbr_max_bw(sk);
+ 		bbr->full_bw_cnt = 0;
+ 		return;
+@@ -1139,50 +1161,31 @@
+ 		bbr_lt_bw_sampling(sk, &rs);
+ 	}
+ }
+ 
+ static struct tcp_congestion_ops tcp_bbr_cong_ops __read_mostly = {
+ 	.flags		= TCP_CONG_NON_RESTRICTED,
+-	.name		= "bbr",
++	.name		= "bbrp",
+ 	.owner		= THIS_MODULE,
+ 	.init		= bbr_init,
+ 	.cong_control	= bbr_main,
+ 	.sndbuf_expand	= bbr_sndbuf_expand,
+ 	.undo_cwnd	= bbr_undo_cwnd,
+ 	.cwnd_event	= bbr_cwnd_event,
+ 	.ssthresh	= bbr_ssthresh,
+ 	.min_tso_segs	= bbr_min_tso_segs,
+ 	.get_info	= bbr_get_info,
+ 	.set_state	= bbr_set_state,
+ };
+ 
+-BTF_KFUNCS_START(tcp_bbr_check_kfunc_ids)
+-BTF_ID_FLAGS(func, bbr_init)
+-BTF_ID_FLAGS(func, bbr_main)
+-BTF_ID_FLAGS(func, bbr_sndbuf_expand)
+-BTF_ID_FLAGS(func, bbr_undo_cwnd)
+-BTF_ID_FLAGS(func, bbr_cwnd_event)
+-BTF_ID_FLAGS(func, bbr_ssthresh)
+-BTF_ID_FLAGS(func, bbr_min_tso_segs)
+-BTF_ID_FLAGS(func, bbr_set_state)
+-BTF_KFUNCS_END(tcp_bbr_check_kfunc_ids)
+-
+-static const struct btf_kfunc_id_set tcp_bbr_kfunc_set = {
+-	.owner = THIS_MODULE,
+-	.set   = &tcp_bbr_check_kfunc_ids,
+-};
++
+ 
+ static int __init bbr_register(void)
+ {
+-	int ret;
+-
+ 	BUILD_BUG_ON(sizeof(struct bbr) > ICSK_CA_PRIV_SIZE);
+ 
+-	ret = register_btf_kfunc_id_set(BPF_PROG_TYPE_STRUCT_OPS, &tcp_bbr_kfunc_set);
+-	if (ret < 0)
+-		return ret;
+ 	return tcp_register_congestion_control(&tcp_bbr_cong_ops);
+ }
+ 
+ static void __exit bbr_unregister(void)
+ {
+ 	tcp_unregister_congestion_control(&tcp_bbr_cong_ops);
+@@ -1193,7 +1196,7 @@
+ 
+ MODULE_AUTHOR("Van Jacobson <vanj@google.com>");
+ MODULE_AUTHOR("Neal Cardwell <ncardwell@google.com>");
+ MODULE_AUTHOR("Yuchung Cheng <ycheng@google.com>");
+ MODULE_AUTHOR("Soheil Hassas Yeganeh <soheil@google.com>");
+ MODULE_LICENSE("Dual BSD/GPL");
+-MODULE_DESCRIPTION("TCP BBR (Bottleneck Bandwidth and RTT)");
++MODULE_DESCRIPTION("TCP BBR patched: rwnd-aware STARTUP exit (bbrp)");
