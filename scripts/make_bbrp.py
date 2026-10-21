@@ -11,9 +11,13 @@ Usage:
 PATCH_DIR must contain the original tcp_bbr.c for the kernel being built.
 The generated tcp_bbrp.c and Makefile are written to PATCH_DIR.  If
 PATCH_DIR is omitted, the parent directory of this script is used.
+
+The generator handles both older kernels (no BTF kfunc registration and
+tp->snd_cwnd) and newer kernels (BTF_SET8/BTF_KFUNCS and tcp_snd_cwnd()).
 """
 import os
 import pathlib
+import re
 import sys
 
 P = pathlib.Path(os.environ.get(
@@ -49,18 +53,20 @@ replace_once(
 )
 
 # 3. Helper: cwnd in bytes > advertised receive window => rwnd-limited.
+#    tcp_snd_cwnd() was added in 6.1; older trees still use tp->snd_cwnd.
 marker = "/* Estimate when the pipe is full, using the change in delivery rate: BBR"
-helper = """/* Return true if the sender's congestion window exceeds the receiver's
- * advertised window, i.e. the connection is receive-window-limited.
- */
-static bool bbrp_is_rwnd_limited(struct sock *sk)
-{
-\tstruct tcp_sock *tp = tcp_sk(sk);
-
-\treturn (u64)tcp_snd_cwnd(tp) * tp->mss_cache > tp->snd_wnd;
-}
-
-"""
+cwnd_expr = "tcp_snd_cwnd(tp)" if "tcp_snd_cwnd(" in src else "tp->snd_cwnd"
+helper = (
+    "/* Return true if the sender's congestion window exceeds the receiver's\n"
+    " * advertised window, i.e. the connection is receive-window-limited.\n"
+    " */\n"
+    "static bool bbrp_is_rwnd_limited(struct sock *sk)\n"
+    "{\n"
+    "\tstruct tcp_sock *tp = tcp_sk(sk);\n"
+    "\n"
+    "\treturn (u64)" + cwnd_expr + " * tp->mss_cache > tp->snd_wnd;\n"
+    "}\n\n"
+)
 replace_once(marker, helper + marker, "rwnd helper")
 
 # 4. In STARTUP exit check, reset the counter on rwnd-limited rounds.
@@ -80,28 +86,43 @@ new_early = (
 )
 replace_once(old_early, new_early, "startup rwnd check")
 
-# 5. Remove BTF kfunc registration: the original tcp_bbr module already
-#    registered this set; a second module registering it can fail.
-start = src.find("BTF_KFUNCS_START(tcp_bbr_check_kfunc_ids)")
+# 5. Remove BTF kfunc registration when the kernel source has it.  The
+#    original tcp_bbr module already registered this set; a second module
+#    registering it can fail.  Older kernels (e.g. 5.15) have no such block.
+btf_markers = (
+    "BTF_KFUNCS_START(tcp_bbr_check_kfunc_ids)",
+    "BTF_SET8_START(tcp_bbr_check_kfunc_ids)",
+)
+start = -1
+for btf_marker in btf_markers:
+    start = src.find(btf_marker)
+    if start >= 0:
+        break
 if start < 0:
-    print("ERROR BTF start not found")
-    sys.exit(1)
-end_marker = "static const struct btf_kfunc_id_set tcp_bbr_kfunc_set = {"
-end_start = src.find(end_marker, start)
-if end_start < 0:
-    print("ERROR BTF set not found")
-    sys.exit(1)
-end = src.find("};", end_start)
-if end < 0:
-    print("ERROR BTF end not found")
-    sys.exit(1)
-end += 2
-removed = src[start:end]
-src = src[:start] + src[end:]
-print(f"OK removed BTF block ({len(removed)} bytes)")
+    print("SKIP BTF block not present (kernel has no tcp_bbr kfunc set)")
+else:
+    end_marker = "static const struct btf_kfunc_id_set tcp_bbr_kfunc_set = {"
+    end_start = src.find(end_marker, start)
+    if end_start < 0:
+        print("ERROR BTF set not found")
+        sys.exit(1)
+    end = src.find("};", end_start)
+    if end < 0:
+        print("ERROR BTF end not found")
+        sys.exit(1)
+    end += 2
+    removed = src[start:end]
+    src = src[:start] + src[end:]
+    print(f"OK removed BTF block ({len(removed)} bytes)")
 
 # 6. Simplify module init to only register the congestion control.
-old_init = """static int __init bbr_register(void)
+new_init = """static int __init bbr_register(void)
+{
+\tBUILD_BUG_ON(sizeof(struct bbr) > ICSK_CA_PRIV_SIZE);
+
+\treturn tcp_register_congestion_control(&tcp_bbr_cong_ops);
+}"""
+old_init_btf = """static int __init bbr_register(void)
 {
 \tint ret;
 
@@ -112,13 +133,24 @@ old_init = """static int __init bbr_register(void)
 \t\treturn ret;
 \treturn tcp_register_congestion_control(&tcp_bbr_cong_ops);
 }"""
-new_init = """static int __init bbr_register(void)
+old_init_plain = """static int __init bbr_register(void)
 {
 \tBUILD_BUG_ON(sizeof(struct bbr) > ICSK_CA_PRIV_SIZE);
 
 \treturn tcp_register_congestion_control(&tcp_bbr_cong_ops);
 }"""
-replace_once(old_init, new_init, "module init")
+if old_init_btf in src:
+    src = src.replace(old_init_btf, new_init, 1)
+    print("OK simplified module init (BTF variant)")
+elif old_init_plain in src:
+    print("OK module init already registers only the congestion control")
+else:
+    init_re = re.compile(r"static int __init bbr_register\(void\)\n\{.*?\n\}", re.S)
+    if len(init_re.findall(src)) != 1:
+        print("ERROR module init: could not find a unique bbr_register() body")
+        sys.exit(1)
+    src = init_re.sub(lambda _m: new_init, src, count=1)
+    print("OK simplified module init (regex variant)")
 
 # 7. Describe the patched module clearly.
 replace_once(

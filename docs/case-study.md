@@ -161,6 +161,9 @@ sudo python3 scripts/verify_listener_cc.py 443
 python3 scripts/loopback_smoke.py
 
 # 4. 断开客户端所有旧连接，重新连接后测速
+
+# 5. 需要时回滚（恢复安装前的模块、boot 配置和运行时 CC）
+sudo ./scripts/rollback.sh
 ```
 
 如果你也想保留测试时的路由参数：
@@ -188,4 +191,4 @@ sudo ip route replace default via <gateway> dev <device> initcwnd 50 initrwnd 50
 - 补丁：`patches/0001-bbrp-rwnd-aware-startup.patch`
 - 原始对照源码：`patches/upstream-tcp_bbr-6.12.107.c`
 - 生成脚本：`scripts/make_bbrp.py`
-- 安装/回滚：`scripts/install.sh`、`scripts/bbrp-rollback.sh`
+- 安装/回滚：`scripts/install.sh`、`scripts/rollback.sh`（旧名 `scripts/bbrp-rollback.sh` 仍可用，但已弃用）

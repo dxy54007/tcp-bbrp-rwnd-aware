@@ -1,0 +1,10 @@
+# Keep this file itself LF so the patterns below are parsed correctly.
+.gitattributes text eol=lf
+
+# Shell/Python scripts are executed on Linux: a CRLF shebang or line ending
+# breaks direct execution (./scripts/install.sh), especially when the repo is
+# cloned on Windows and run through WSL.
+*.sh   text eol=lf
+*.py   text eol=lf
+*.conf text eol=lf
+Makefile text eol=lf
