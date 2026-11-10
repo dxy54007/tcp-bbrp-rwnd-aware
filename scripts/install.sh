@@ -1,27 +1,13 @@
 #!/usr/bin/env bash
 # One-click installer for the tcp_bbrp out-of-tree kernel module.
 #
-# Supported: Debian and Ubuntu (and closely related Debian derivatives).
-# The original in-tree tcp_bbr module is never overwritten.  The new module
-# registers a separate congestion-control algorithm named "bbrp", so the
-# original "bbr" and "cubic" remain available as fallbacks.
+# The script does exactly one job: build tcp_bbrp.ko for the running kernel,
+# install it, and make "bbrp" the default congestion control at boot.
+# It never restarts proxy services and never touches routes or initcwnd.
 #
-# Safety model
-# ------------
-# * Preflight checks do not change persistent system state.
-# * The module is built and validated before anything is installed.
-# * A state snapshot is written to /var/backups/tcp-bbrp/<stamp>/ before the
-#   first mutation, and /var/lib/tcp-bbrp/current points at it.
-# * Every mutation after that point is protected by an ERR/INT/TERM trap that
-#   automatically calls rollback.sh if a step fails.
-# * The module is smoke-tested on loopback before it is made the default CC.
-# * The only failure this script cannot recover from is a kernel panic or
-#   hard lock-up caused by a module bug.  The script refuses to run when
-#   kernel.panic_on_oops/panic_on_warn is enabled unless --accept-risk is
-#   given, and it recommends a snapshot/console before installing.
-#
-# Exit codes: 0 = success, 1 = failure, 2 = usage error,
-#             3 = installed but a proxy service failed to restart.
+# The original in-tree tcp_bbr module is not modified.  The new module
+# registers a separate congestion-control algorithm named "bbrp", so "bbr"
+# and "cubic" remain available as fallbacks.
 #
 # License: GPL-2.0 (same as the rest of the repository).
 
@@ -29,13 +15,18 @@ set -Eeuo pipefail
 umask 022
 export LC_ALL=C
 
-SCRIPT_VERSION="2.0.0"
+SCRIPT_VERSION="3.0.0"
 SELF="${BASH_SOURCE[0]}"
 if command -v readlink >/dev/null 2>&1; then
     SELF="$(readlink -f -- "$SELF" 2>/dev/null || printf '%s' "$SELF")"
 fi
 SCRIPT_DIR="$(cd -- "$(dirname -- "$SELF")" && pwd -P)"
 ROOT="$(cd -- "$SCRIPT_DIR/.." && pwd -P)"
+
+REPO_OWNER="dxy54007"
+REPO_NAME="tcp-bbrp-rwnd-aware"
+REPO_BRANCH="main"
+REPO_TARBALL="https://github.com/$REPO_OWNER/$REPO_NAME/archive/refs/heads/$REPO_BRANCH.tar.gz"
 
 MODULE_NAME="tcp_bbrp"
 CC_NAME="bbrp"
@@ -60,22 +51,17 @@ KO_INPUT=""
 SOURCE_INPUT=""
 FORCE_BUILD=0
 INSTALL_DEPS=1
-ASSUME_YES=0
 DRY_RUN=0
-RUN_SMOKE=1
-RESTART_MODE="auto"
 ACCEPT_RISK=0
 AUTO_ROLLBACK=1
 KEEP_BUILD_DIR=0
 VERBOSE=0
-RESTART_SERVICES=()
 
 # Runtime state.
 DISTRO_ID="unknown"
 DISTRO_VERSION="unknown"
 DISTRO_NAME="unknown"
 CONFIG_FILE=""
-TMP_CONFIG=""
 HEADERS_OK=0
 NEED_BUILD=1
 CANDIDATE_KO=""
@@ -83,24 +69,22 @@ KO_PATH=""
 BUILD_DIR=""
 BUILD_LOG=""
 TMP_SRC=""
+TMP_CONFIG=""
 APT_LOG=""
 APT_UPDATED=0
 MISSING_PKGS=()
 NEW_PACKAGES=()
 WANT_FQ=1
-FQ_CONFIGURED=1
 MODULE_UNLOAD_SUPPORTED=1
 SIG_ENFORCE=0
 SECURE_BOOT=0
 AVAILABLE_CC=""
 CURRENT_STATE_DIR=""
 ALREADY_INSTALLED=0
-DETECTED_SERVICES=()
-SERVICES_TO_RESTART=()
-SERVICES_RESTARTED=()
-SERVICE_FAILURES=()
+BOOTSTRAP_DIR=""
+LOG_FILE=""
 
-# State-file fields.
+# State-file fields.  Keep version 1 so older rollback copies can still read it.
 META_VERSION=1
 STATUS=""
 CREATED_AT=""
@@ -117,19 +101,6 @@ CC_APPLIED=0
 TRANSACTION_ACTIVE=0
 BACKUP_DIR=""
 LOCK_DIR=""
-
-KNOWN_SERVICES=(
-    x-ui
-    3x-ui
-    xray
-    v2ray
-    v2raya
-    sing-box
-    hysteria-server
-    hysteria
-    trojan-go
-    shadowsocks-libev
-)
 
 # ---------------------------------------------------------------------------
 # Logging and small helpers
@@ -172,63 +143,33 @@ usage() {
 tcp_bbrp one-click installer (Debian / Ubuntu)
 
 Usage:
-  sudo ./scripts/install.sh [options]
+  curl -fsSL https://raw.githubusercontent.com/dxy54007/tcp-bbrp-rwnd-aware/main/scripts/install.sh -o /tmp/bbrp-install.sh
+  bash /tmp/bbrp-install.sh [options]
 
 What it does:
-  1. Runs read-only preflight checks (distro, kernel, headers, Secure Boot,
-     lockdown, panic settings, disk/memory, existing installation, sysctl
-     ordering, modprobe blacklists, service state).
-  2. Installs only the missing build dependencies with apt-get.
-  3. Uses a matching prebuilt tcp_bbrp.ko if present, otherwise builds from
-     the checked-in source.  If that source is incompatible with the running
-     kernel, it can install the matching linux-source package and regenerate.
-  4. Backs up existing module/config files and records the original runtime
-     congestion-control state in /var/backups/tcp-bbrp/<stamp>/.
-  5. Installs to /lib/modules/$(uname -r)/extra, runs depmod/modprobe,
-     verifies registration, and runs a loopback smoke test.
-  6. Writes boot persistence, applies the runtime sysctl, and restarts known
-     proxy services that were active so their listeners use bbrp.
-  7. On any failure after the snapshot, automatically invokes rollback.sh.
+  * builds tcp_bbrp.ko for the running kernel (or uses --ko),
+  * installs it under /lib/modules/$(uname -r)/extra,
+  * writes modules-load.d/sysctl.d entries so bbrp is used after boot,
+  * keeps a snapshot so rollback.sh can restore the previous state.
+
+It does NOT restart proxy services, change routes, or set initcwnd/initrwnd.
 
 Options:
-  --ko PATH              Use this prebuilt module (still validated).
+  --ko PATH              Use this prebuilt module instead of building.
   --source PATH          Regenerate from a kernel tcp_bbr.c at PATH.
-  --rebuild              Ignore ./tcp_bbrp.ko and build from source.
+  --rebuild              Ignore any prebuilt module and build from source.
   --no-deps              Never call apt-get; fail if dependencies are missing.
-  -y, --yes              Non-interactive; accept the linux-source fallback
-                         prompt.  Missing apt dependencies are installed
-                         automatically unless --no-deps is given.
-  --dry-run              Run checks, print the plan, change nothing.
-  --no-smoke             Skip the loopback smoke test (not recommended).
-  --no-restart           Do not restart any proxy service.
-  --restart SERVICE      Restart this systemd unit after install (repeatable).
-                         If given, automatic service detection is disabled.
+  --dry-run              Run checks and print the plan, change nothing.
   --accept-risk          Continue when panic_on_oops/panic_on_warn is enabled.
-  --no-auto-rollback     Keep the failed installation for debugging instead of
-                         automatically calling rollback.sh (dangerous).
-  --keep-build-dir       Keep the temporary build directory for inspection.
+  --no-auto-rollback     Keep a failed installation for debugging.
+  --keep-build-dir       Keep the temporary build directory.
   --verbose              Print more diagnostic detail.
   -h, --help             Show this help.
 
 Examples:
-  sudo ./scripts/install.sh
-  sudo ./scripts/install.sh --dry-run
-  sudo ./scripts/install.sh --restart x-ui --restart sing-box
-  sudo ./scripts/install.sh --ko /root/tcp_bbrp.ko
-  sudo ./scripts/install.sh --source /usr/src/linux/net/ipv4/tcp_bbr.c
-
-Rollback:
-  sudo ./scripts/rollback.sh                 # restore the previous state
-  sudo ./scripts/rollback.sh --list          # list saved states
-  sudo ./scripts/rollback.sh --keep-config   # runtime switch only
-
-Safety notes:
-  * Existing SSH sessions are not affected by changing the default CC, but a
-    buggy kernel module can still panic the host.  Use a VPS snapshot and
-    console access for production machines.
-  * Secure Boot and kernel lockdown must allow unsigned out-of-tree modules.
-  * After a kernel upgrade the module must be rebuilt; boot falls back to bbr
-    or cubic because the old module cannot be loaded.
+  bash /tmp/bbrp-install.sh
+  bash /tmp/bbrp-install.sh --dry-run
+  bash /tmp/bbrp-install.sh --source /usr/src/linux/net/ipv4/tcp_bbr.c
 EOF
 }
 
@@ -257,40 +198,9 @@ parse_args() {
                 INSTALL_DEPS=0
                 shift
                 ;;
-            -y|--yes)
-                ASSUME_YES=1
-                shift
-                ;;
             --dry-run)
                 DRY_RUN=1
                 shift
-                ;;
-            --no-smoke)
-                RUN_SMOKE=0
-                shift
-                ;;
-            --no-restart)
-                if [[ "$RESTART_MODE" == "manual" ]]; then
-                    err "--no-restart and --restart are mutually exclusive"
-                    exit 2
-                fi
-                RESTART_MODE="none"
-                RESTART_SERVICES=()
-                shift
-                ;;
-            --restart)
-                [[ $# -ge 2 ]] || { usage; exit 2; }
-                if [[ "$RESTART_MODE" == "none" ]]; then
-                    err "--no-restart and --restart are mutually exclusive"
-                    exit 2
-                fi
-                if [[ ! "$2" =~ ^[A-Za-z0-9_.@:-]+$ ]]; then
-                    err "invalid service name: $2"
-                    exit 2
-                fi
-                RESTART_MODE="manual"
-                RESTART_SERVICES+=("$2")
-                shift 2
                 ;;
             --accept-risk)
                 ACCEPT_RISK=1
@@ -325,7 +235,6 @@ parse_args() {
         usage
         exit 2
     fi
-
     if [[ -n "$KO_INPUT" && -n "$SOURCE_INPUT" ]]; then
         err "--ko and --source are mutually exclusive"
         exit 2
@@ -334,6 +243,20 @@ parse_args() {
         err "--ko and --rebuild are mutually exclusive"
         exit 2
     fi
+}
+
+ensure_root() {
+    [[ "${EUID:-$(id -u)}" -eq 0 ]] && return 0
+    if [[ ! -f "$SELF" ]]; then
+        err "root is required; download the script to a file and run it with sudo"
+        exit 1
+    fi
+    if command -v sudo >/dev/null 2>&1; then
+        info "root is required; re-running with sudo"
+        exec sudo -- bash "$SELF" "$@"
+    fi
+    err "root is required; run this script with sudo"
+    exit 1
 }
 
 setup_logging() {
@@ -348,7 +271,6 @@ setup_logging() {
         LOG_FILE=""
         return 0
     fi
-    # Keep console output and a persistent audit trail.
     exec > >(tee -a "$LOG_FILE") 2>&1
 }
 
@@ -375,9 +297,6 @@ release_lock() {
         rmdir -- "$LOCK_DIR" 2>/dev/null || true
         LOCK_DIR=""
     fi
-    # Closing the flock descriptor releases the kernel lock.  Do not redirect
-    # stderr here: "exec" redirections would otherwise persist for the rest of
-    # the script and silence the auto-rollback output.
     exec 9>&- || true
 }
 
@@ -390,6 +309,9 @@ cleanup() {
     fi
     if [[ -n "${BUILD_DIR:-}" && -d "${BUILD_DIR:-}" && ${KEEP_BUILD_DIR:-0} -eq 0 ]]; then
         rm -rf -- "$BUILD_DIR" 2>/dev/null || true
+    fi
+    if [[ -n "${BOOTSTRAP_DIR:-}" && -d "${BOOTSTRAP_DIR:-}" ]]; then
+        rm -rf -- "$BOOTSTRAP_DIR" 2>/dev/null || true
     fi
     release_lock
 }
@@ -418,7 +340,7 @@ on_error() {
                     ;;
                 3)
                     err "installation failed; rollback completed with warnings"
-                    err "review the rollback output above, then run: sudo $SCRIPT_DIR/rollback.sh --state $BACKUP_DIR"
+                    err "review the rollback output, then run: sudo $SCRIPT_DIR/rollback.sh"
                     ;;
                 *)
                     err "installation failed AND automatic rollback failed (exit $rb_rc)"
@@ -430,7 +352,7 @@ on_error() {
             print_manual_recovery
         fi
     else
-        info "no automatic rollback: the transaction was not active (pre-snapshot or already committed)"
+        info "no automatic rollback: the transaction was not active"
     fi
 
     exit "$rc"
@@ -450,11 +372,51 @@ trap 'on_signal TERM' TERM
 trap 'on_signal HUP' HUP
 
 # ---------------------------------------------------------------------------
-# Generic checks
+# Source bootstrap (for the curl ... | bash one-liner)
+# ---------------------------------------------------------------------------
+
+fetch_file() {
+    local url="$1" dest="$2"
+    if command -v curl >/dev/null 2>&1; then
+        curl -fsSL --retry 3 --connect-timeout 15 -o "$dest" "$url"
+    elif command -v wget >/dev/null 2>&1; then
+        wget -q -O "$dest" "$url"
+    else
+        return 127
+    fi
+}
+
+bootstrap_repo() {
+    if [[ -f "$ROOT/tcp_bbrp.c" && -f "$ROOT/Makefile" && -f "$SCRIPT_DIR/make_bbrp.py" ]]; then
+        return 0
+    fi
+    section "Download repository source"
+    if ! command -v curl >/dev/null 2>&1 && ! command -v wget >/dev/null 2>&1; then
+        apt_update_once
+        apt_install_packages ca-certificates curl || die "cannot install curl"
+    fi
+    command -v tar >/dev/null 2>&1 || die "tar is required"
+
+    BOOTSTRAP_DIR="$(mktemp -d "${TMPDIR:-/var/tmp}/tcp-bbrp-repo.XXXXXX")" || die "cannot create a temporary directory"
+    local tarball="$BOOTSTRAP_DIR/repo.tar.gz"
+    info "downloading $REPO_TARBALL"
+    if ! fetch_file "$REPO_TARBALL" "$tarball"; then
+        die "cannot download the repository; check network access"
+    fi
+    tar -xzf "$tarball" -C "$BOOTSTRAP_DIR" --strip-components=1 || die "cannot extract the repository archive"
+    rm -f -- "$tarball"
+    ROOT="$BOOTSTRAP_DIR"
+    SCRIPT_DIR="$ROOT/scripts"
+    [[ -f "$ROOT/tcp_bbrp.c" && -f "$ROOT/Makefile" && -f "$SCRIPT_DIR/make_bbrp.py" ]] \
+        || die "downloaded repository is incomplete"
+    ok "repository downloaded"
+}
+
+# ---------------------------------------------------------------------------
+# Generic helpers
 # ---------------------------------------------------------------------------
 
 version_ge() {
-    # version_ge A B  ->  true when A >= B
     [[ "$(printf '%s\n%s\n' "$2" "$1" | sort -V | head -n1)" == "$2" ]]
 }
 
@@ -538,22 +500,14 @@ config_enabled() {
     [[ "$v" == "y" || "$v" == "m" ]]
 }
 
-config_builtin() {
-    [[ "$(config_value "$1" || true)" == "y" ]]
-}
-
 detect_fq() {
-    FQ_CONFIGURED=1
-    if [[ -n "$CONFIG_FILE" ]] && ! config_enabled NET_SCH_FQ; then
-        FQ_CONFIGURED=0
-    fi
     WANT_FQ=1
-    if command -v modprobe >/dev/null 2>&1; then
+    if [[ -n "$CONFIG_FILE" ]] && ! config_enabled NET_SCH_FQ; then
+        WANT_FQ=0
+    elif command -v modprobe >/dev/null 2>&1; then
         if ! modprobe -n -v sch_fq >/dev/null 2>&1; then
             WANT_FQ=0
         fi
-    elif [[ $FQ_CONFIGURED -eq 0 ]]; then
-        WANT_FQ=0
     fi
     if [[ $WANT_FQ -eq 0 ]]; then
         warn "sch_fq is not available; net.core.default_qdisc will not be changed"
@@ -604,6 +558,7 @@ current_state_dir() {
 read_state_field() {
     local file="$1" key="$2"
     (
+        set +u
         unset STATUS META_VERSION KVER ORIG_CC INSTALLED_KO_SHA256
         # shellcheck disable=SC1090
         . "$file" >/dev/null 2>&1 || exit 1
@@ -620,10 +575,6 @@ read_state_field() {
 # ---------------------------------------------------------------------------
 # Preflight checks
 # ---------------------------------------------------------------------------
-
-check_root() {
-    [[ "${EUID:-$(id -u)}" -eq 0 ]] || die "run this script as root (sudo)"
-}
 
 check_os() {
     section "Preflight: operating system"
@@ -654,13 +605,9 @@ check_os() {
     command -v sort >/dev/null 2>&1 || die "sort not found"
 
     if [[ "$DISTRO_ID" == "ubuntu" && "$DISTRO_VERSION" != "unknown" ]]; then
-        if ! version_ge "$DISTRO_VERSION" "20.04"; then
-            warn "Ubuntu $DISTRO_VERSION is older than the tested baseline (20.04)"
-        fi
+        version_ge "$DISTRO_VERSION" "20.04" || warn "Ubuntu $DISTRO_VERSION is older than the tested baseline (20.04)"
     elif [[ "$DISTRO_ID" == "debian" && "$DISTRO_VERSION" != "unknown" ]]; then
-        if ! version_ge "$DISTRO_VERSION" "11"; then
-            warn "Debian $DISTRO_VERSION is older than the tested baseline (11)"
-        fi
+        version_ge "$DISTRO_VERSION" "11" || warn "Debian $DISTRO_VERSION is older than the tested baseline (11)"
     fi
     ok "$DISTRO_NAME"
 }
@@ -681,7 +628,7 @@ check_arch_kernel() {
             ;;
     esac
     if [[ "$KVER" == *microsoft* || "$KVER" == *WSL* ]]; then
-        die "WSL kernel detected; load the module on a real Linux host, not in WSL"
+        die "WSL kernel detected; install the module on a real Linux host"
     fi
 
     local major minor
@@ -700,10 +647,6 @@ check_arch_kernel() {
         info "kernel headers for $KVER are missing or incomplete; apt-get will be used"
     else
         ok "kernel headers: $KDIR"
-    fi
-
-    if [[ ! -d /run/systemd/system ]]; then
-        warn "systemd is not running; modules-load.d/sysctl.d boot persistence cannot be verified"
     fi
     ok "kernel $KVER, architecture $ARCH"
 }
@@ -727,23 +670,17 @@ check_kernel_policy() {
     section "Preflight: module loading policy"
     detect_kernel_config || warn "could not read the running kernel configuration"
     if [[ -n "$CONFIG_FILE" ]]; then
-        if ! config_enabled MODULES; then
-            die "CONFIG_MODULES is not enabled in the running kernel"
-        fi
+        config_enabled MODULES || die "CONFIG_MODULES is not enabled in the running kernel"
         if ! config_enabled MODULE_UNLOAD; then
             MODULE_UNLOAD_SUPPORTED=0
-            warn "CONFIG_MODULE_UNLOAD is not enabled; rollback will require a reboot to unload"
-        fi
-        if ! config_enabled NET_SCH_FQ; then
-            FQ_CONFIGURED=0
-            warn "CONFIG_NET_SCH_FQ is not enabled; fq will not be selected"
+            warn "CONFIG_MODULE_UNLOAD is not enabled; rollback will need a reboot to unload"
         fi
         if config_enabled MODULE_SIG_FORCE; then
             SIG_ENFORCE=1
             info "CONFIG_MODULE_SIG_FORCE is enabled; the module must be signed"
         fi
         if config_enabled CC_IS_CLANG; then
-            warn "the running kernel was built with clang; a gcc-built external module may be incompatible"
+            warn "the running kernel was built with clang; a gcc-built module may be incompatible"
         fi
     else
         warn "kernel config not found; cannot verify CONFIG_MODULES/MODULE_SIG_FORCE"
@@ -757,25 +694,17 @@ check_kernel_policy() {
 
     local modules_disabled
     modules_disabled="$(cat /proc/sys/kernel/modules_disabled 2>/dev/null || printf '0')"
-    if [[ "$modules_disabled" != "0" ]]; then
-        die "kernel.modules_disabled=$modules_disabled; module loading is disabled"
-    fi
+    [[ "$modules_disabled" == "0" ]] || die "kernel.modules_disabled=$modules_disabled; module loading is disabled"
 
     if [[ -r /sys/module/module/parameters/sig_enforce ]]; then
         local se
         se="$(cat /sys/module/module/parameters/sig_enforce 2>/dev/null || true)"
-        if [[ "$se" == "Y" || "$se" == "1" ]]; then
-            SIG_ENFORCE=1
-        fi
+        [[ "$se" == "Y" || "$se" == "1" ]] && SIG_ENFORCE=1
     fi
 
     detect_secure_boot
-    if [[ $SECURE_BOOT -eq 1 ]]; then
-        warn "Secure Boot is enabled; an unsigned module will not load"
-    fi
-    if [[ $SIG_ENFORCE -eq 1 ]]; then
-        warn "kernel module signature enforcement is active"
-    fi
+    [[ $SECURE_BOOT -eq 1 ]] && warn "Secure Boot is enabled; an unsigned module will not load"
+    [[ $SIG_ENFORCE -eq 1 ]] && warn "kernel module signature enforcement is active"
 
     local panic_oops panic_warn
     panic_oops="$(cat /proc/sys/kernel/panic_on_oops 2>/dev/null || printf '0')"
@@ -791,9 +720,7 @@ check_kernel_policy() {
 
     local tainted
     tainted="$(cat /proc/sys/kernel/tainted 2>/dev/null || printf '0')"
-    if [[ "$tainted" != "0" ]]; then
-        warn "kernel is already tainted (tainted=$tainted); loading this module adds the out-of-tree taint"
-    fi
+    [[ "$tainted" != "0" ]] && warn "kernel is already tainted (tainted=$tainted)"
     ok "module loading is permitted by the current kernel policy"
 }
 
@@ -802,8 +729,6 @@ check_existing_install() {
     AVAILABLE_CC="$(cat /proc/sys/net/ipv4/tcp_available_congestion_control 2>/dev/null || true)"
     [[ -n "$AVAILABLE_CC" ]] || die "cannot read the kernel congestion-control list"
 
-    # Make the original BBR available as a rollback target.  Loading tcp_bbr is
-    # harmless and does not change the current default.
     if ! grep -qw bbr <<<"$AVAILABLE_CC"; then
         if [[ $DRY_RUN -eq 0 ]] && command -v modprobe >/dev/null 2>&1 && modprobe tcp_bbr >/dev/null 2>&1; then
             AVAILABLE_CC="$(cat /proc/sys/net/ipv4/tcp_available_congestion_control 2>/dev/null || true)"
@@ -822,7 +747,7 @@ check_existing_install() {
             installed)
                 if [[ "$sk" != "$KVER" ]]; then
                     info "the current snapshot belongs to kernel $sk; installing a new one for $KVER"
-                    info "the old snapshot is kept for audit: sudo $SCRIPT_DIR/rollback.sh --list"
+                    info "the old snapshot is kept: sudo $SCRIPT_DIR/rollback.sh --list"
                 elif existing_install_healthy; then
                     ALREADY_INSTALLED=1
                     ok "tcp_bbrp is already installed and active"
@@ -830,10 +755,10 @@ check_existing_install() {
                         "$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null || echo '?')" \
                         "$(sysctl -n net.core.default_qdisc 2>/dev/null || echo '?')" \
                         "$DEST"
-                    info "to rebuild or downgrade, run: sudo $SCRIPT_DIR/rollback.sh && sudo $SCRIPT_DIR/install.sh"
-                    exit 0
+                    info "to rebuild, run: sudo $SCRIPT_DIR/rollback.sh && sudo $SCRIPT_DIR/install.sh"
+                    return 0
                 else
-                    die "a previous installation state exists (kernel $sk, status $st) but it is not healthy; run: sudo $SCRIPT_DIR/rollback.sh"
+                    die "a previous installation exists but is not healthy; run: sudo $SCRIPT_DIR/rollback.sh"
                 fi
                 ;;
             in-progress|rolling-back|rollback-failed)
@@ -843,10 +768,10 @@ check_existing_install() {
                 info "found a completed rollback state; a fresh installation may proceed"
                 ;;
             "")
-                die "state file $CURRENT_STATE_DIR/meta.env has no STATUS; inspect it and use rollback.sh --state"
+                die "state file $CURRENT_STATE_DIR/meta.env has no STATUS; use rollback.sh --state"
                 ;;
             *)
-                die "unrecognised state '$st' in $CURRENT_STATE_DIR; run rollback.sh --state explicitly"
+                die "unrecognised state '$st' in $CURRENT_STATE_DIR; use rollback.sh --state"
                 ;;
         esac
     fi
@@ -854,15 +779,9 @@ check_existing_install() {
     if grep -qw "$CC_NAME" <<<"$AVAILABLE_CC" || lsmod 2>/dev/null | grep -q "^$MODULE_NAME "; then
         die "$CC_NAME is already registered/loaded without a managed state; run: sudo $SCRIPT_DIR/rollback.sh"
     fi
-    if [[ -e "$DEST" || -L "$DEST" ]]; then
-        info "existing module file will be backed up: $DEST"
-    fi
-    if [[ -e "$MODULES_CONF" || -L "$MODULES_CONF" ]]; then
-        info "existing boot config will be backed up: $MODULES_CONF"
-    fi
-    if [[ -e "$SYSCTL_CONF" || -L "$SYSCTL_CONF" ]]; then
-        info "existing boot config will be backed up: $SYSCTL_CONF"
-    fi
+    [[ -e "$DEST" || -L "$DEST" ]] && info "existing module file will be backed up: $DEST"
+    [[ -e "$MODULES_CONF" || -L "$MODULES_CONF" ]] && info "existing boot config will be backed up: $MODULES_CONF"
+    [[ -e "$SYSCTL_CONF" || -L "$SYSCTL_CONF" ]] && info "existing boot config will be backed up: $SYSCTL_CONF"
     ok "no active conflicting installation"
 }
 
@@ -870,8 +789,7 @@ existing_install_healthy() {
     [[ "$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null || true)" == "$CC_NAME" ]] || return 1
     grep -qw "$CC_NAME" /proc/sys/net/ipv4/tcp_available_congestion_control 2>/dev/null || return 1
     lsmod 2>/dev/null | grep -q "^$MODULE_NAME " || return 1
-    [[ -f "$DEST" ]] || return 1
-    [[ -f "$MODULES_CONF" && -f "$SYSCTL_CONF" ]] || return 1
+    [[ -f "$DEST" && -f "$MODULES_CONF" && -f "$SYSCTL_CONF" ]] || return 1
     grep -qF "$MARKER" "$MODULES_CONF" 2>/dev/null || return 1
     grep -qF "$MARKER" "$SYSCTL_CONF" 2>/dev/null || return 1
     [[ -r /sys/module/$MODULE_NAME/parameters/rwnd_aware ]] || return 1
@@ -897,6 +815,29 @@ check_modprobe_conflicts() {
         fi
     fi
     ok "no modprobe blacklist or module-name conflict"
+}
+
+scan_sysctl_file() {
+    local file="$1"
+    local -n out="$2"
+    [[ -r "$file" ]] || return 0
+    local line key val clean
+    while IFS= read -r line || [[ -n "$line" ]]; do
+        clean="${line%%#*}"
+        [[ "$clean" =~ ^[[:space:]]*(net\.ipv4\.tcp_congestion_control|net\.core\.default_qdisc)[[:space:]]*=[[:space:]]*(.*)$ ]] || continue
+        key="${BASH_REMATCH[1]}"
+        val="${BASH_REMATCH[2]}"
+        val="${val%%#*}"
+        val="${val//[[:space:]]/}"
+        [[ -n "$val" ]] || continue
+        if [[ "$key" == "net.ipv4.tcp_congestion_control" && "$val" != "$CC_NAME" ]]; then
+            out+=("$file: $line")
+        fi
+        if [[ "$key" == "net.core.default_qdisc" && $WANT_FQ -eq 1 && "$val" != "fq" ]]; then
+            out+=("$file: $line")
+        fi
+    done < "$file"
+    return 0
 }
 
 check_sysctl_conflicts() {
@@ -931,87 +872,6 @@ check_sysctl_conflicts() {
     ok "no later sysctl file overrides tcp_congestion_control/default_qdisc"
 }
 
-scan_sysctl_file() {
-    local file="$1"
-    local -n out="$2"
-    [[ -r "$file" ]] || return 0
-    local line key val clean
-    while IFS= read -r line || [[ -n "$line" ]]; do
-        clean="${line%%#*}"
-        [[ "$clean" =~ ^[[:space:]]*(net\.ipv4\.tcp_congestion_control|net\.core\.default_qdisc)[[:space:]]*=[[:space:]]*(.*)$ ]] || continue
-        key="${BASH_REMATCH[1]}"
-        val="${BASH_REMATCH[2]}"
-        val="${val%%#*}"
-        val="${val//[[:space:]]/}"
-        [[ -n "$val" ]] || continue
-        if [[ "$key" == "net.ipv4.tcp_congestion_control" && "$val" != "$CC_NAME" ]]; then
-            out+=("$file: $line")
-        fi
-        if [[ "$key" == "net.core.default_qdisc" && $WANT_FQ -eq 1 && "$val" != "fq" ]]; then
-            out+=("$file: $line")
-        fi
-    done < "$file"
-}
-
-detect_services() {
-    DETECTED_SERVICES=()
-    command -v systemctl >/dev/null 2>&1 || return 0
-    [[ -d /run/systemd/system ]] || return 0
-    local s
-    for s in "${KNOWN_SERVICES[@]}"; do
-        if systemctl is-active --quiet "$s" 2>/dev/null; then
-            DETECTED_SERVICES+=("$s")
-        fi
-    done
-}
-
-check_services() {
-    section "Preflight: proxy services"
-    detect_services
-
-    if [[ "$RESTART_MODE" == "none" ]]; then
-        SERVICES_TO_RESTART=()
-        info "service restart disabled by --no-restart"
-        return 0
-    fi
-
-    if [[ "$RESTART_MODE" == "manual" ]]; then
-        if ! command -v systemctl >/dev/null 2>&1; then
-            die "--restart requires systemd, but systemctl was not found"
-        fi
-        local s
-        for s in "${RESTART_SERVICES[@]}"; do
-            if ! systemctl cat "$s" >/dev/null 2>&1 && ! systemctl cat "$s.service" >/dev/null 2>&1; then
-                die "systemd unit not found: $s"
-            fi
-            SERVICES_TO_RESTART+=("$s")
-        done
-    else
-        SERVICES_TO_RESTART=("${DETECTED_SERVICES[@]}")
-    fi
-
-    # De-duplicate while preserving order.
-    local -A seen=()
-    local dedup=()
-    local s
-    for s in "${SERVICES_TO_RESTART[@]:-}"; do
-        [[ -n "$s" ]] || continue
-        [[ -n "${seen[$s]:-}" ]] && continue
-        seen["$s"]=1
-        dedup+=("$s")
-    done
-    SERVICES_TO_RESTART=()
-    if (( ${#dedup[@]} > 0 )); then
-        SERVICES_TO_RESTART=("${dedup[@]}")
-    fi
-
-    if (( ${#SERVICES_TO_RESTART[@]} > 0 )); then
-        ok "will restart: ${SERVICES_TO_RESTART[*]}"
-    else
-        info "no known active proxy service detected; restart your listener manually after install"
-    fi
-}
-
 check_module_candidate() {
     section "Preflight: module source"
     NEED_BUILD=1
@@ -1042,15 +902,14 @@ check_module_candidate() {
     else
         [[ -f "$ROOT/tcp_bbrp.c" ]] || die "$ROOT/tcp_bbrp.c not found"
         [[ -f "$ROOT/Makefile" ]] || die "$ROOT/Makefile not found"
-        info "will build from the checked-in tcp_bbrp.c (6.12 base); a version-matched kernel source is used as fallback if needed"
+        info "will build from the checked-in tcp_bbrp.c; a version-matched kernel source is used as fallback"
     fi
-    NEED_BUILD=1
 }
 
 check_build_requirements() {
     section "Preflight: build environment"
     local c
-    for c in install mktemp awk sed grep sort df sha256sum tee timeout od; do
+    for c in install mktemp awk sed grep sort df sha256sum tee timeout od tar; do
         command -v "$c" >/dev/null 2>&1 || die "required base command '$c' is missing"
     done
     command -v sysctl >/dev/null 2>&1 || add_missing_pkg procps
@@ -1063,12 +922,11 @@ check_build_requirements() {
         if ! command -v gcc >/dev/null 2>&1 || ! command -v make >/dev/null 2>&1 || ! command -v ld >/dev/null 2>&1; then
             add_missing_pkg build-essential
         fi
-        if [[ $HEADERS_OK -eq 0 ]]; then
-            add_missing_pkg "linux-headers-$KVER"
-        fi
+        [[ $HEADERS_OK -eq 0 ]] && add_missing_pkg "linux-headers-$KVER"
         command -v bc >/dev/null 2>&1 || add_missing_pkg bc
         command -v xz >/dev/null 2>&1 || add_missing_pkg xz-utils
         command -v bzip2 >/dev/null 2>&1 || add_missing_pkg bzip2
+        command -v python3 >/dev/null 2>&1 || add_missing_pkg python3
         if [[ -n "$CONFIG_FILE" ]] && config_enabled DEBUG_INFO_BTF_MODULES && ! command -v pahole >/dev/null 2>&1; then
             add_missing_pkg dwarves
         fi
@@ -1081,11 +939,6 @@ check_build_requirements() {
         || ! command -v modprobe >/dev/null 2>&1 || ! command -v lsmod >/dev/null 2>&1; then
         add_missing_pkg kmod
     fi
-    if ! command -v python3 >/dev/null 2>&1; then
-        if [[ $NEED_BUILD -eq 1 || $RUN_SMOKE -eq 1 ]]; then
-            add_missing_pkg python3
-        fi
-    fi
 
     if (( ${#MISSING_PKGS[@]} > 0 )); then
         info "missing packages: ${MISSING_PKGS[*]}"
@@ -1095,11 +948,12 @@ check_build_requirements() {
     else
         ok "build/runtime dependencies are present"
     fi
+    return 0
 }
 
 check_resources() {
     section "Preflight: memory and disk"
-    local mem_kb need_mb=32 tmp_base
+    local mem_kb need_mb=32
     mem_kb="$(awk '/^MemAvailable:/ {print $2}' /proc/meminfo 2>/dev/null || printf '0')"
     if [[ -n "$mem_kb" ]] && (( mem_kb > 0 && mem_kb < 65536 )); then
         die "less than 64 MB of available memory; building/loading a module is unsafe"
@@ -1108,19 +962,11 @@ check_resources() {
     fi
 
     [[ $NEED_BUILD -eq 1 ]] && need_mb=300
-    tmp_base="${TMPDIR:-/var/tmp}"
-    if ! check_disk_space "$need_mb" "$tmp_base"; then
-        die "need at least ${need_mb} MB free under $tmp_base"
+    if ! check_disk_space "$need_mb" "${TMPDIR:-/var/tmp}"; then
+        die "need at least ${need_mb} MB free under ${TMPDIR:-/var/tmp}"
     fi
-    if ! check_disk_space 32 "$DEST_DIR"; then
-        die "need at least 32 MB free under /lib/modules/$KVER"
-    fi
-    if ! check_disk_space 16 /var; then
-        die "need at least 16 MB free under /var for the state snapshot"
-    fi
-    if ! check_disk_space 8 /etc; then
-        die "need at least 8 MB free under /etc"
-    fi
+    check_disk_space 32 "$DEST_DIR" || die "need at least 32 MB free under /lib/modules/$KVER"
+    check_disk_space 16 /var || die "need at least 16 MB free under /var for the state snapshot"
     ok "resources look sufficient"
 }
 
@@ -1132,9 +978,7 @@ apt_update_once() {
     [[ $APT_UPDATED -eq 1 ]] && return 0
     APT_UPDATED=1
     APT_LOG="${LOG_ROOT}/apt-$STAMP.log"
-    if [[ -z "${LOG_FILE:-}" ]]; then
-        APT_LOG="${TMPDIR:-/var/tmp}/tcp-bbrp-apt-$STAMP.log"
-    fi
+    [[ -n "${LOG_FILE:-}" ]] || APT_LOG="${TMPDIR:-/var/tmp}/tcp-bbrp-apt-$STAMP.log"
     : > "$APT_LOG" 2>/dev/null || APT_LOG="/dev/null"
     info "running apt-get update"
     if ! DEBIAN_FRONTEND=noninteractive apt-get update -qq >>"$APT_LOG" 2>&1; then
@@ -1173,16 +1017,13 @@ install_missing_packages() {
     if [[ $INSTALL_DEPS -eq 0 ]]; then
         die "missing packages (${MISSING_PKGS[*]}); rerun without --no-deps"
     fi
-    if ! apt_install_packages "${MISSING_PKGS[@]}"; then
-        die "could not install required packages; no kernel changes were made"
-    fi
+    apt_install_packages "${MISSING_PKGS[@]}" || die "could not install required packages; no kernel changes were made"
     MISSING_PKGS=()
     ok "dependencies installed"
 }
 
 verify_build_environment() {
     section "Dependencies: verification"
-    local c
     detect_kernel_config || warn "could not re-read the running kernel configuration"
     if [[ $NEED_BUILD -eq 1 ]]; then
         detect_headers
@@ -1190,23 +1031,16 @@ verify_build_environment() {
         if [[ ! -f "$KDIR/include/config/kernel.release" ]] || [[ "$(cat "$KDIR/include/config/kernel.release" 2>/dev/null || true)" != "$KVER" ]]; then
             die "kernel headers do not match the running kernel $KVER"
         fi
-        if [[ -n "$CONFIG_FILE" ]] && config_enabled MODVERSIONS; then
-            [[ -s "$KDIR/Module.symvers" ]] || die "$KDIR/Module.symvers is missing but CONFIG_MODVERSIONS is enabled; install the full matching linux-headers package"
-        fi
-        for c in gcc make ld modinfo depmod modprobe; do
+        local c
+        for c in gcc make ld modinfo depmod modprobe python3; do
             command -v "$c" >/dev/null 2>&1 || die "required build command '$c' is still missing"
         done
-        if ! command -v python3 >/dev/null 2>&1; then
-            die "python3 is required to regenerate a version-matched module"
-        fi
     else
+        local c
         for c in modinfo depmod modprobe; do
             command -v "$c" >/dev/null 2>&1 || die "required module command '$c' is still missing"
         done
     fi
-
-    # Re-detect fq after installing kmod, then re-check sysctl ordering because
-    # the qdisc requirement may have changed.
     detect_fq
     check_sysctl_conflicts
     ok "environment is ready"
@@ -1232,7 +1066,6 @@ validate_module() {
     vermagic="$(modinfo -F vermagic "$ko" 2>/dev/null | awk '{print $1}' || true)"
     if [[ "$vermagic" != "$KVER" ]]; then
         err "module vermagic '$vermagic' does not match running kernel '$KVER'"
-        err "rebuild against /lib/modules/$KVER/build"
         return 1
     fi
 
@@ -1380,7 +1213,6 @@ extract_tcp_bbr() {
         [[ -f "$dest/tcp_bbr.c" ]] && return 0
     fi
 
-    # Some archives do not have exactly three leading path components.
     raw="$dest/raw"
     rm -rf -- "$raw"
     mkdir -p "$raw" || return 1
@@ -1397,7 +1229,7 @@ extract_tcp_bbr() {
 
 try_build_from_kernel_source() {
     section "Build: version-matched kernel source fallback"
-    local tarball="" pkg="" size mb ans bdir
+    local tarball="" pkg="" bdir
     tarball="$(find_source_tarball || true)"
 
     if [[ -z "$tarball" ]]; then
@@ -1411,18 +1243,6 @@ try_build_from_kernel_source() {
             err "--no-deps prevents installing $pkg"
             err "install it manually: apt-get install -y $pkg"
             return 1
-        fi
-        size="$(apt-cache show "$pkg" 2>/dev/null | awk -F': ' '/^Size:/ {print $2; exit}')"
-        mb=0
-        [[ "$size" =~ ^[0-9]+$ ]] && mb=$(( (size + 1048575) / 1048576 ))
-        if [[ $ASSUME_YES -eq 0 ]]; then
-            if [[ ! -t 0 ]]; then
-                die "non-interactive session; pass --yes to allow installing $pkg"
-            fi
-            printf 'Install %s (~%s MB download) to generate a version-matched module? [y/N] ' "$pkg" "$mb"
-            ans=""
-            read -r ans || ans=""
-            [[ "$ans" =~ ^[Yy]$ ]] || { err "declined; rerun with --source or install $pkg manually"; return 1; }
         fi
         if ! check_disk_space 400 /usr/src; then
             err "need at least 400 MB free under /usr/src for $pkg"
@@ -1442,17 +1262,11 @@ try_build_from_kernel_source() {
     fi
     bdir="$(mktemp -d "${TMPDIR:-/var/tmp}/tcp-bbrp-build.XXXXXX")" || return 1
     BUILD_DIR="$bdir"
-    BUILD_LOG="${LOG_ROOT}/build-$STAMP.log"
-    [[ -n "${LOG_FILE:-}" ]] || BUILD_LOG="${TMPDIR:-/var/tmp}/tcp-bbrp-build-$STAMP.log"
-    : > "$BUILD_LOG" 2>/dev/null || BUILD_LOG="/dev/null"
+    set_build_log
 
     cp -- "$TMP_SRC/tcp_bbr.c" "$BUILD_DIR/tcp_bbr.c" || return 1
-    if ! generate_from_source "$BUILD_DIR/tcp_bbr.c" "$BUILD_DIR"; then
-        return 1
-    fi
-    if ! run_make "$BUILD_DIR"; then
-        return 1
-    fi
+    generate_from_source "$BUILD_DIR/tcp_bbr.c" "$BUILD_DIR" || return 1
+    run_make "$BUILD_DIR" || return 1
     KO_PATH="$BUILD_DIR/tcp_bbrp.ko"
     validate_module "$KO_PATH" || return 1
     ok "built version-matched module from $tarball"
@@ -1469,18 +1283,14 @@ build_module() {
     if [[ -n "$SOURCE_INPUT" ]]; then
         info "regenerating from $SOURCE_INPUT"
         cp -- "$SOURCE_INPUT" "$BUILD_DIR/tcp_bbr.c" || die "cannot copy $SOURCE_INPUT"
-        if ! generate_from_source "$BUILD_DIR/tcp_bbr.c" "$BUILD_DIR"; then
-            die "failed to generate tcp_bbrp.c from $SOURCE_INPUT"
-        fi
-        if ! run_make "$BUILD_DIR"; then
-            die "failed to build tcp_bbrp.ko from $SOURCE_INPUT"
-        fi
+        generate_from_source "$BUILD_DIR/tcp_bbr.c" "$BUILD_DIR" || die "failed to generate tcp_bbrp.c from $SOURCE_INPUT"
+        run_make "$BUILD_DIR" || die "failed to build tcp_bbrp.ko from $SOURCE_INPUT"
     else
         cp -- "$ROOT/tcp_bbrp.c" "$BUILD_DIR/tcp_bbrp.c" || die "cannot copy tcp_bbrp.c"
         cp -- "$ROOT/Makefile" "$BUILD_DIR/Makefile" || die "cannot copy Makefile"
         if ! run_make "$BUILD_DIR"; then
             warn "the checked-in 6.12-based source is incompatible with kernel $KVER"
-            warn "trying to install/extract the version-matched kernel source"
+            warn "trying the version-matched kernel source"
             if ! try_build_from_kernel_source; then
                 die "could not build a module for kernel $KVER; see $BUILD_LOG"
             fi
@@ -1495,7 +1305,7 @@ build_module() {
 check_module_signature_policy() {
     if [[ $SECURE_BOOT -eq 1 || $SIG_ENFORCE -eq 1 ]]; then
         if module_is_signed "$KO_PATH"; then
-            warn "Secure Boot/signature enforcement is active; the module is signed, but the key must be enrolled in the kernel keyring"
+            warn "Secure Boot/signature enforcement is active; the module is signed, but its key must be enrolled"
         else
             die "$KO_PATH is unsigned while Secure Boot/signature enforcement is active; sign it or disable Secure Boot"
         fi
@@ -1509,10 +1319,7 @@ check_module_signature_policy() {
 write_meta() {
     [[ -n "${BACKUP_DIR:-}" && -d "${BACKUP_DIR:-}" ]] || return 1
     UPDATED_AT="$(date '+%Y-%m-%dT%H:%M:%S%z')"
-    local tmp np sr started
-    np="${NEW_PACKAGES[*]:-}"
-    sr="${SERVICES_TO_RESTART[*]:-}"
-    started="${SERVICES_RESTARTED[*]:-}"
+    local tmp
     tmp="$(mktemp "$BACKUP_DIR/.meta.XXXXXX")" || return 1
     {
         printf 'META_VERSION=%q\n' "$META_VERSION"
@@ -1540,9 +1347,6 @@ write_meta() {
         printf 'SECURE_BOOT=%q\n' "$SECURE_BOOT"
         printf 'SIG_ENFORCE=%q\n' "$SIG_ENFORCE"
         printf 'CC_APPLIED=%q\n' "$CC_APPLIED"
-        printf 'NEW_PACKAGES=%q\n' "$np"
-        printf 'SERVICES_TO_RESTART=%q\n' "$sr"
-        printf 'SERVICES_RESTARTED=%q\n' "$started"
     } > "$tmp" || { rm -f -- "$tmp"; return 1; }
     chmod 600 "$tmp" 2>/dev/null || true
     mv -f -- "$tmp" "$BACKUP_DIR/meta.env"
@@ -1622,12 +1426,9 @@ install_module_file() {
 
 load_module() {
     section "Install: depmod and modprobe"
-    if [[ -z "${BUILD_LOG:-}" ]]; then
-        set_build_log
-    fi
-    if ! depmod -a "$KVER" >>"$BUILD_LOG" 2>&1; then
-        die "depmod -a $KVER failed; the module index was not updated"
-    fi
+    [[ -n "${BUILD_LOG:-}" ]] || set_build_log
+    depmod -a "$KVER" >>"$BUILD_LOG" 2>&1 || die "depmod -a $KVER failed"
+
     local found found_real dest_real
     found="$(modinfo -n "$MODULE_NAME" 2>/dev/null || true)"
     found_real="$(readlink -f -- "$found" 2>/dev/null || printf '%s' "$found")"
@@ -1654,30 +1455,17 @@ load_module() {
     ok "module loaded; bbrp is registered (rwnd_aware=$rwnd)"
 }
 
-run_smoke() {
-    section "Verify: loopback smoke test"
-    if [[ $RUN_SMOKE -eq 0 ]]; then
-        warn "smoke test skipped by --no-smoke"
-        return 0
+write_atomic() {
+    local dest="$1" content="$2" mode="$3" dir tmp
+    dir="$(dirname -- "$dest")"
+    install -d -m 755 "$dir" || return 1
+    tmp="$(mktemp "$dir/.$(basename -- "$dest").XXXXXX")" || return 1
+    if ! printf '%s' "$content" > "$tmp"; then
+        rm -f -- "$tmp"
+        return 1
     fi
-    if ! command -v python3 >/dev/null 2>&1; then
-        warn "python3 is unavailable; smoke test skipped"
-        return 0
-    fi
-    if [[ ! -f "$SCRIPT_DIR/loopback_smoke.py" ]]; then
-        warn "$SCRIPT_DIR/loopback_smoke.py not found; smoke test skipped"
-        return 0
-    fi
-    local out
-    out="${LOG_ROOT}/smoke-$STAMP.log"
-    [[ -n "${LOG_FILE:-}" ]] || out="${TMPDIR:-/var/tmp}/tcp-bbrp-smoke-$STAMP.log"
-    if ! timeout 60 python3 "$SCRIPT_DIR/loopback_smoke.py" --size-mb 16 >"$out" 2>&1; then
-        err "loopback smoke test failed; last 30 lines:"
-        tail -30 "$out" >&2 || true
-        die "the module did not pass the loopback transfer test"
-    fi
-    tail -5 "$out" | sed 's/^/       /' || true
-    ok "loopback transfer completed with bbrp"
+    chmod "$mode" "$tmp" 2>/dev/null || true
+    mv -f -- "$tmp" "$dest"
 }
 
 write_persistence() {
@@ -1709,29 +1497,12 @@ write_persistence() {
     ok "wrote $MODULES_CONF and $SYSCTL_CONF"
 }
 
-write_atomic() {
-    local dest="$1" content="$2" mode="$3" dir tmp
-    dir="$(dirname -- "$dest")"
-    install -d -m 755 "$dir" || return 1
-    tmp="$(mktemp "$dir/.$(basename -- "$dest").XXXXXX")" || return 1
-    if ! printf '%s' "$content" > "$tmp"; then
-        rm -f -- "$tmp"
-        return 1
-    fi
-    chmod "$mode" "$tmp" 2>/dev/null || true
-    mv -f -- "$tmp" "$dest"
-}
-
 apply_runtime() {
     section "Install: applying runtime sysctl"
     if [[ $WANT_FQ -eq 1 ]]; then
-        if ! sysctl -w net.core.default_qdisc=fq >/dev/null; then
-            die "cannot set net.core.default_qdisc=fq"
-        fi
+        sysctl -w net.core.default_qdisc=fq >/dev/null || die "cannot set net.core.default_qdisc=fq"
     fi
-    if ! sysctl -w "net.ipv4.tcp_congestion_control=$CC_NAME" >/dev/null; then
-        die "cannot set net.ipv4.tcp_congestion_control=$CC_NAME"
-    fi
+    sysctl -w "net.ipv4.tcp_congestion_control=$CC_NAME" >/dev/null || die "cannot set net.ipv4.tcp_congestion_control=$CC_NAME"
     local cc qd
     cc="$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null || true)"
     qd="$(sysctl -n net.core.default_qdisc 2>/dev/null || true)"
@@ -1742,71 +1513,13 @@ apply_runtime() {
     ok "runtime cc=$cc qdisc=$qd"
 }
 
-restart_services() {
-    section "Services: recreating listeners"
-    SERVICES_RESTARTED=()
-    SERVICE_FAILURES=()
-    if (( ${#SERVICES_TO_RESTART[@]} == 0 )); then
-        info "no services to restart; existing listeners keep their old CC until restarted"
-        return 0
-    fi
-    if ! command -v systemctl >/dev/null 2>&1; then
-        warn "systemctl not found; services were not restarted"
-        return 0
-    fi
-
-    local s active
-    for s in "${SERVICES_TO_RESTART[@]}"; do
-        active=0
-        if systemctl is-active --quiet "$s" 2>/dev/null; then
-            active=1
-        fi
-        # Automatic mode only touches services that were active at preflight.
-        # Explicit --restart is allowed to start an inactive unit.
-        if [[ $active -eq 0 && "$RESTART_MODE" != "manual" ]]; then
-            continue
-        fi
-        if timeout 90 systemctl restart "$s"; then
-            SERVICES_RESTARTED+=("$s")
-            ok "restarted $s"
-        else
-            SERVICE_FAILURES+=("$s")
-            err "failed to restart $s; last status:"
-            systemctl status --no-pager -l "$s" 2>&1 | tail -15 >&2 || true
-        fi
-    done
-
-    STATUS="installed"
-    write_meta >/dev/null 2>&1 || warn "could not update the service list in $BACKUP_DIR/meta.env"
-
-    if (( ${#SERVICE_FAILURES[@]} > 0 )); then
-        warn "installation is complete, but these services failed to restart: ${SERVICE_FAILURES[*]}"
-        warn "fix the service, then restart it manually so its listeners use $CC_NAME"
-    fi
-}
-
-verify_listener() {
-    (( ${#SERVICES_RESTARTED[@]} > 0 )) || return 0
-    command -v ss >/dev/null 2>&1 || return 0
-    command -v python3 >/dev/null 2>&1 || return 0
-    [[ -f "$SCRIPT_DIR/verify_listener_cc.py" ]] || return 0
-    local addrs
-    addrs="$(ss -ltn 2>/dev/null | awk '{print $4}' || true)"
-    grep -qE '[:.]443$' <<<"$addrs" || return 0
-    if ! timeout 20 python3 "$SCRIPT_DIR/verify_listener_cc.py" 443 --expect "$CC_NAME" >/dev/null 2>&1; then
-        warn "could not confirm that the 443 listener uses $CC_NAME; verify with: python3 $SCRIPT_DIR/verify_listener_cc.py 443"
-    else
-        ok "443 listener uses $CC_NAME"
-    fi
-}
-
 # ---------------------------------------------------------------------------
 # Dry-run and final reporting
 # ---------------------------------------------------------------------------
 
 print_dry_run() {
     section "Dry run summary (no changes made)"
-    local modsrc services
+    local modsrc
     if [[ $NEED_BUILD -eq 0 ]]; then
         modsrc="$CANDIDATE_KO"
     elif [[ -n "$SOURCE_INPUT" ]]; then
@@ -1814,7 +1527,6 @@ print_dry_run() {
     else
         modsrc="build from $ROOT/tcp_bbrp.c (fallback: version-matched linux-source)"
     fi
-    services="${SERVICES_TO_RESTART[*]:-none}"
     printf '  distro:      %s\n' "$DISTRO_NAME"
     printf '  kernel:      %s (%s)\n' "$KVER" "$ARCH"
     printf '  headers:     %s\n' "$([[ $HEADERS_OK -eq 1 ]] && echo "$KDIR" || echo 'missing (would install)')"
@@ -1824,8 +1536,6 @@ print_dry_run() {
     printf '  runtime:     cc=%s' "$CC_NAME"
     [[ $WANT_FQ -eq 1 ]] && printf ' qdisc=fq'
     printf '\n'
-    printf '  services:    %s\n' "$services"
-    printf '  smoke test:  %s\n' "$([[ $RUN_SMOKE -eq 1 ]] && echo yes || echo no)"
     printf '  secure boot: %s\n' "$([[ $SECURE_BOOT -eq 1 ]] && echo enabled || echo disabled)"
     if (( ${#MISSING_PKGS[@]} > 0 )); then
         printf '  packages:    %s (would install)\n' "${MISSING_PKGS[*]}"
@@ -1841,7 +1551,7 @@ print_manual_recovery() {
 
 Manual recovery
 ---------------
-1. Switch new sockets back to the original BBR (or cubic):
+1. Switch new sockets back to the previous BBR (or cubic):
      sysctl -w net.ipv4.tcp_congestion_control=bbr 2>/dev/null ||
      sysctl -w net.ipv4.tcp_congestion_control=cubic
      sysctl -w net.core.default_qdisc=fq 2>/dev/null || true
@@ -1853,16 +1563,13 @@ Manual recovery
      rm -f "$dest"
      depmod -a "$KVER"
 5. Restore files from the snapshot, if one exists:
-     ls -l "$BACKUP_DIR" 2>/dev/null || true
-     cp -a "$BACKUP_DIR/modules-load.conf" "$mods_conf" 2>/dev/null || true
-     cp -a "$BACKUP_DIR/sysctl.conf" "$sysctl_conf" 2>/dev/null || true
-     cp -a "$BACKUP_DIR/tcp_bbrp.ko.orig" "$dest" 2>/dev/null || true
+     ls -l "${BACKUP_DIR:-/var/backups/tcp-bbrp}" 2>/dev/null || true
+     cp -a "${BACKUP_DIR:-/var/backups/tcp-bbrp}/modules-load.conf" "$mods_conf" 2>/dev/null || true
+     cp -a "${BACKUP_DIR:-/var/backups/tcp-bbrp}/sysctl.conf" "$sysctl_conf" 2>/dev/null || true
+     cp -a "${BACKUP_DIR:-/var/backups/tcp-bbrp}/tcp_bbrp.ko.orig" "$dest" 2>/dev/null || true
      depmod -a "$KVER"
-6. Restart proxy listeners so they open new sockets.
 
-If the host is unstable, reboot it.  Boot persistence points at the module
-only if it was committed; after removing the files above the host boots with
-bbr or cubic and the old tcp_bbr.ko is never touched.
+If the host is unstable, reboot it.  The in-tree tcp_bbr.ko is never touched.
 EOF
 }
 
@@ -1879,22 +1586,14 @@ print_summary() {
     printf '  boot config:  %s\n' "$MODULES_CONF"
     printf '  boot config:  %s\n' "$SYSCTL_CONF"
     printf '  snapshot:     %s\n' "$BACKUP_DIR"
-    if (( ${#SERVICES_RESTARTED[@]} > 0 )); then
-        printf '  restarted:    %s\n' "${SERVICES_RESTARTED[*]}"
-    fi
     if (( ${#NEW_PACKAGES[@]} > 0 )); then
         printf '  packages:     installed for the build and intentionally kept: %s\n' "${NEW_PACKAGES[*]}"
     fi
-    if [[ -n "${LOG_FILE:-}" ]]; then
-        printf '  log:          %s\n' "$LOG_FILE"
-    fi
-    if [[ -n "$BUILD_DIR" && -d "$BUILD_DIR" ]]; then
-        printf '  build dir:    %s\n' "$BUILD_DIR"
-    fi
+    [[ -n "${LOG_FILE:-}" ]] && printf '  log:          %s\n' "$LOG_FILE"
+    [[ -n "$BUILD_DIR" && -d "$BUILD_DIR" ]] && printf '  build dir:    %s\n' "$BUILD_DIR"
     printf '\n  rollback:     sudo %s/rollback.sh\n' "$SCRIPT_DIR"
-    printf '  runtime-only: sudo %s/rollback.sh --runtime-only\n' "$SCRIPT_DIR"
-    printf '\nOnly sockets created after this point use %s.  Restart any\n' "$CC_NAME"
-    printf 'listener that was not restarted automatically.\n'
+    printf '\nOnly new sockets use %s.  Restart your proxy/listener manually\n' "$CC_NAME"
+    printf 'when you want existing services to use it.  No service or route was touched.\n'
 }
 
 # ---------------------------------------------------------------------------
@@ -1903,28 +1602,28 @@ print_summary() {
 
 main() {
     parse_args "$@"
-    check_root
+    ensure_root "$@"
+    check_os
     setup_logging
     acquire_lock
+    bootstrap_repo
 
     section "tcp_bbrp installer $SCRIPT_VERSION"
-    check_os
     check_arch_kernel
     check_container
     check_kernel_policy
     check_existing_install
+    if (( ALREADY_INSTALLED == 1 )); then
+        exit 0
+    fi
     check_modprobe_conflicts
 
     detect_fq
     check_sysctl_conflicts
-    check_services
     check_module_candidate
     check_build_requirements
     check_resources
 
-    if (( ALREADY_INSTALLED == 1 )); then
-        exit 0
-    fi
     if (( DRY_RUN == 1 )); then
         print_dry_run
         exit 0
@@ -1946,7 +1645,6 @@ main() {
     create_state
     install_module_file
     load_module
-    run_smoke
     write_persistence
     apply_runtime
 
@@ -1956,13 +1654,7 @@ main() {
     write_meta || die "cannot commit the installation state"
     TRANSACTION_ACTIVE=0
 
-    restart_services
-    verify_listener
     print_summary
-
-    if (( ${#SERVICE_FAILURES[@]} > 0 )); then
-        exit 3
-    fi
 }
 
 main "$@"

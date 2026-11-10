@@ -1,12 +1,13 @@
 #!/usr/bin/env bash
 # Deprecated compatibility wrapper for the old rollback script name.
 #
-# The implementation now lives in rollback.sh.  This wrapper keeps existing
+# The implementation lives in rollback.sh.  This wrapper keeps existing
 # commands working:
 #   bbrp-rollback.sh              -> rollback.sh
-#   bbrp-rollback.sh --full       -> rollback.sh --reset-route
 #   bbrp-rollback.sh --keep-config-> rollback.sh --keep-config
 #   bbrp-rollback.sh --remove     -> rollback.sh --remove
+#
+# There is no route/initcwnd handling: rollback.sh never touches routes.
 #
 # New scripts and documentation should call rollback.sh directly.
 
@@ -24,7 +25,9 @@ args=()
 for arg in "$@"; do
     case "$arg" in
         --full)
-            args+=("--reset-route")
+            # Route/initcwnd handling was removed; keep the old command working
+            # by ignoring this flag instead of failing.
+            printf 'NOTE: --full no longer changes routes; ignoring it\n' >&2
             ;;
         *)
             args+=("$arg")
